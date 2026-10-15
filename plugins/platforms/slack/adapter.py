@@ -1041,6 +1041,9 @@ class SlackAdapter(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.SLACK)
+        # Optional transport-owned interception after normal Slack authorization.
+        # Plugins receive the Bolt event here, never through model-visible text.
+        self._authorized_message_hook: Optional[Callable[..., Awaitable[bool]]] = None
         self._app: Optional[Any] = None
         self._handler: Optional[Any] = None
         self._socket_mode_task: Optional[asyncio.Task] = None
@@ -1693,6 +1696,34 @@ class SlackAdapter(BasePlatformAdapter):
         # ctx.register_platform_handler("slack", ...) factories get the full
         # AsyncApp surface (event/action/command), wired before Socket Mode starts.
         self._wire_plugin_handlers(self._app)
+
+    def set_authorized_message_hook(
+        self, hook: Optional[Callable[..., Awaitable[bool]]],
+    ) -> None:
+        """Install a transport callback for already-authorized Slack messages.
+
+        A plugin factory may register this before Socket Mode starts. The hook
+        must return True only when it has handled the message; False preserves
+        the normal Hermes conversation path. It never bypasses the existing
+        sender, channel, mention, bot, or replay filters.
+        """
+        self._authorized_message_hook = hook
+
+    async def _run_authorized_message_hook(
+        self, *, event: dict, body: Optional[dict], team_id: str,
+        channel_id: str, user_id: str, text: str,
+    ) -> bool:
+        hook = self._authorized_message_hook
+        if hook is None:
+            return False
+        try:
+            return bool(await hook(
+                event=event, body=body, team_id=team_id,
+                channel_id=channel_id, user_id=user_id, text=text,
+            ))
+        except Exception:
+            logger.exception("[Slack] Authorized message hook failed")
+            return False
 
     def _register_plugin_action_handlers(self) -> None:
         """Wire ``ctx.register_slack_action_handler`` callbacks; each is wrapped so a plugin
@@ -4647,6 +4678,11 @@ class SlackAdapter(BasePlatformAdapter):
         _claim_ts = str(event.get("ts") or "")
         if _claim_ts:
             self._remember_processed_message_ts(_claim_ts)
+        if await self._run_authorized_message_hook(
+            event=event, body=payload, team_id=team_id,
+            channel_id=channel_id, user_id=user_id, text=original_text,
+        ):
+            return
         if is_mentioned:
             text, original_text, command_probe_text, is_command_text = self._apply_bot_mention(
                 text, original_text, command_probe_text, is_command_text, bot_uid, thread_ts,
